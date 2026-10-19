@@ -1,0 +1,30 @@
+[package]
+name = "live2d-ai-mod-memory"
+description = "Live2D-Ai 本地记忆 Mod：纯函数词元重叠检索 + 本地 JSONL 存储 + 会话分桶注入 + 真摘要（旁车可回滚）；无向量 / embedding 依赖"
+version = "0.3.1"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-only"
+authors = ["Sakura Motion Project"]
+
+[dependencies]
+live2d-ai-mod-system = { path = "../Live2D-Ai/crates/live2d-ai-mod-system" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# P1-5（真摘要）：OpenAI 兼容摘要的**真实** HTTP 客户端（summary_http.rs）。
+# - blocking：Summarizer::summarize 是**同步**契约。memory 的 Mod 事件 worker
+#   不在 tokio runtime 内，而触发点又必须**非阻塞主链**——所以调用发生在
+#   触发点 spawn 出来的后台线程上（见 lib.rs::spawn_summary），blocking 客户端
+#   自己起内部 runtime；
+# - rustls-tls：与 runtime / desktop / director 同一条 TLS 口径（不用 native-tls）。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+# 密钥查找**唯一**口径：.env 快照 > 进程环境（AGENTS「密钥真源 = .env」）。
+live2d-ai-runtime = { path = "../Live2D-Ai/crates/live2d-ai-runtime" }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+
+[workspace]

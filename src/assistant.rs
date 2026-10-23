@@ -84,8 +84,10 @@ impl MemoryRuntime {
     /// - payload 坏 / 缺 text / text 空白 → warn + 本轮跳过（**不 panic**）；
     /// - 事件里的 role 只作 provenance 校验：本主题契约恒 assistant，非
     ///   assistant 只 warn 仍按助手侧入桶；
-    /// - 轮次：优先 payload.turn，缺失回落 self.turn_seq（同轮用户记录的值）——
-    ///   同轮共用一个 turn 是摘要「保留最近 K 轮」按 turn 分组的前提；
+    /// - 轮次（2026-10-23 / 0.4.4）：**不再用 payload.turn 作为记录 turn**，
+    ///   而是取该会话桶里**最后一条 User 记录**的 turn（同轮用户 + 助手共用
+    ///   一个 turn 是摘要「保留最近 K 轮」按 turn 分组的前提）；桶里没有用户
+    ///   记录时保守回落 `self.turn_seq`。payload.turn **只写进日志**；
     /// - **不阻塞主链**：只做一次本地追加（与 TurnPrompt 的 remember 同一个
     ///   append_capped），没有网络、没有锁等待；失败只 warn。
     pub(crate) fn handle_assistant_replied(&mut self, payload: &str, session: Option<&str>) {
@@ -110,10 +112,6 @@ impl MemoryRuntime {
                 "memory AssistantReplied 的 role={role} 非 assistant（契约异常），仍按助手侧入桶"
             ));
         }
-        let turn = value
-            .get("turn")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(self.turn_seq);
         // 会话来源：优先事件带的（host 每轮都带，与 TurnPrompt 同一个 id）；
         // 没带就回落到本轮的 current_session（unscoped 投递路径）。
         let raw_session = session
@@ -125,11 +123,36 @@ impl MemoryRuntime {
                 .logger
                 .warn("memory 助手侧收到非法会话 id，退回全局桶（不拿它拼路径）");
         }
+        // 轮次：payload.turn **只作日志**；记录 turn 必须与同轮用户行一致。
+        // 取该会话最后一条 User 记录的 turn，无记录时保守回落 self.turn_seq。
+        let payload_turn = value.get("turn").and_then(serde_json::Value::as_u64);
+        let turn = self
+            .last_user_turn(normalized.as_deref())
+            .unwrap_or(self.turn_seq);
+        let payload_turn_note = match payload_turn {
+            Some(turn) => format!("payload.turn={turn} 仅作日志"),
+            None => "payload.turn 缺失".to_string(),
+        };
         if self.remember_assistant(text, strategy::unix_now(), turn, normalized.as_deref()) {
             self.services.logger.info(&format!(
-                "memory 已记录助手侧正文 {} 字（turn={turn}）",
+                "memory 已记录助手侧正文 {} 字（turn={turn}；{payload_turn_note}）",
                 text.chars().count()
             ));
         }
+    }
+
+    /// 该会话桶里**最后一条 `User` 记录**的 turn（同轮助手记录必须与它共用）。
+    ///
+    /// 只读：`load(0)` 不写盘、不创建文件。路径不可解析 / 读取失败 / 桶里
+    /// 还没有用户记录 → `None`（调用方回落 `self.turn_seq`，保守且不 panic）。
+    fn last_user_turn(&self, session: Option<&str>) -> Option<u64> {
+        let store = self.store_for(session)?;
+        let loaded = store.load(0).ok()?;
+        loaded
+            .records
+            .iter()
+            .rev()
+            .find(|record| record.role == strategy::MemoryRole::User)
+            .map(|record| record.turn)
     }
 }

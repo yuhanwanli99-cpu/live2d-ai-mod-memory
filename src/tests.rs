@@ -1,5 +1,5 @@
 //! 运行时级回归：Mod 生命周期 + `TurnPrompt` 一轮的记/检索/注入 + 物理淘汰 +
-//! 计数 + 与 persona 共存（last-writer-wins）+ 停用清残留。
+//! 计数 + 无会话不写全局 persona（P1-5）+ 停用清残留。
 //!
 //! 纯逻辑（分词 / 打分 / top-k / marker / 路径）的单测在 `strategy_tests.rs`，
 //! JSONL 读写与物理淘汰的单测在 `store.rs`，检索质量基线在 `quality_tests.rs`；
@@ -648,7 +648,7 @@ fn clear_without_store_path_fails_as_command_failed() {
     assert_eq!(rt.state_json().unwrap()["errors"], 1);
 }
 
-// ------------------------------------------- 与 persona 共存：last-writer-wins
+// ------------------------------------------- 无会话：不写全局 persona（P1-5）
 
 #[test]
 fn no_conversation_never_touches_global_persona_prompt() {

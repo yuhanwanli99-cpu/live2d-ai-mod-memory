@@ -64,13 +64,14 @@
 //! ```text
 //! 用户输入 ──► supervisor 发 TurnStarted（turn id）
 //!              └► supervisor 发 TurnPrompt（本轮正文, session）  ◄── memory 在这里干活
-//!                   ├─ remember(正文, now, turn)
-//!                   │    → 追加 <桶> 一行（有会话: sessions/<id>.memory.jsonl；
-//!                   │      无会话: 老路径 memory.jsonl）
+//!                   ├─ remember_lines(正文按换行拆条, now, turn)
+//!                   │    → 每条非空行追加 <桶> 一行（有会话: sessions/<id>.memory.jsonl；
+//!                   │      无会话: 老路径 memory.jsonl；同轮共用一个 turn）
 //!                   │    └─ 超过 max_records → 物理淘汰最旧（Wave 3）
-//!                   ├─ 载入（窗口 max_records）+ 检索 top-k（排除刚写入的那条）
-//!                   └─ 非空 → 有会话: session_prompts.set_owned(MEMORY, session, 本 Mod 的块)
-//!                             无会话: 不注入（**绝不**写全局 persona.system_prompt）
+//!                   ├─ 载入（窗口 max_records）+ 检索 top-k（排除本轮刚写入的全部条）
+//!                   └─ 命中或摘要在手 → 有会话: session_prompts.set_owned(MEMORY, session, 本 Mod 的块)
+//!                                       无会话: 不注入（**绝不**写全局 persona.system_prompt）
+//!                      本轮未命中且无摘要 → 保留上一轮注入块（不清槽）
 //!              └► 构建本轮请求体（用的还是**旧** system_prompt）
 //!              └► supervisor 决议 system_prompt（读到刚写的注入）→ 本轮请求体带上它
 //! 助手说完 ──► supervisor 发 AssistantReplied（turn, 清洗后正文, session）
@@ -103,8 +104,9 @@
 //! 宿主按固定顺序把非空槽拼成最终 system_prompt（匿名 → persona → memory）。
 //! 因此：
 //!
-//! - **全局（无会话）**：仍然都写 `persona.system_prompt`，谁后写谁覆盖
-//!   ——这是既有口径，未改；
+//! - **无会话**：写入 `memory.jsonl`，**不注入**，也**不写**全局
+//!   `persona.system_prompt`——P1-5 起删掉全局降级，「谁后写谁覆盖」
+//!   不再成立；
 //! - **会话（有会话）**：persona 写角色卡、memory 写记忆块，**互不覆盖**；
 //!   memory 每轮只重拼**自己的块**（先剥旧 marker 再拼，幂等），
 //!   persona 的卡一个字不动；
@@ -113,10 +115,10 @@
 //!   （旧实现正是这样静默清掉了 persona 的会话卡）；
 //! - **跨会话不串**：A 会话的写入只进 A 的槽，B 读不到。
 //!
-//! 全局路径的已知取舍（system 只有一个入口、没有优先级表）钉死在
+//! 无会话路径**没有**全局提示词写回（只落 `memory.jsonl`）：这是 P1-5 起明文
+//! 的降级，不是等价能力。会话槽按 owner 隔离的口径见
 //! `docs/architecture/memory-mod-v0.md` §5.1 与
-//! `docs/plans/parallel-mods/REGISTER-memory-v0.md` §3.2，并有两向对称回归
-//! （`tests.rs` 的 `last_writer_wins_*`）。
+//! `docs/plans/parallel-mods/REGISTER-memory-v0.md` §3.2。
 //!
 //! # 启停（唯一真源 = Mod manifest 的 `enabled`）
 //!
@@ -350,6 +352,26 @@ impl MemoryRuntime {
         self.append_record_in(session.as_deref(), record)
     }
 
+    /// 把本轮用户原文按**换行**拆成多条非空记录（一条一行），返回成功落盘条数。
+    ///
+    /// 每条用**同一个 `turn`**；空行 / 纯空白行跳过（`trim` 后为空即丢）。
+    /// 失败只 warn + 计数（[`Self::remember`] 的口径），不打断这一轮。
+    /// 检索仍用**整段原文**（[`Self::retrieve_excluding_tail`] 一次排除本轮
+    /// 刚写入的全部记录，避免当轮正文自命中）。
+    fn remember_lines(&mut self, text: &str, ts: i64, turn: u64) -> usize {
+        let mut written = 0;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if self.remember(line, ts, turn) {
+                written += 1;
+            }
+        }
+        written
+    }
+
     /// 检索 top-k（`strategy::rank_top_k` 的 IO + 坏行可见化包装）。
     ///
     /// `exclude_last` = 排除**桶里最后一条**（刚被 `remember` 追加的那条，
@@ -359,17 +381,27 @@ impl MemoryRuntime {
     /// 「摘要」的身份进了注入块，再整条塞一遍就等于没有任何压缩（原文出两次、
     /// token 照吃）。摘要回滚后覆盖位点退回，这批原文**重新可被检索**。
     pub fn retrieve_with(&mut self, query: &str, exclude_last: bool) -> Vec<MemoryRecord> {
+        self.retrieve_excluding_tail(query, if exclude_last { 1 } else { 0 })
+    }
+
+    /// 同 [`Self::retrieve_with`]，但排除桶尾的 `exclude_tail` 条。
+    ///
+    /// 用户原文按换行拆成多条后，「本轮刚写入的」不再是一条而是 N 条：一次性
+    /// 排除整段尾部，才能保持「当轮正文不自命中并注入」的原判据。
+    fn retrieve_excluding_tail(&mut self, query: &str, exclude_tail: usize) -> Vec<MemoryRecord> {
         let Some((records, offset)) = self.load_bucket() else {
             return Vec::new();
         };
         let start = self.effective_summary_start(records.len(), offset);
-        let last = records.len().checked_sub(1);
+        let keep = records.len().saturating_sub(exclude_tail);
         let covered: BTreeSet<usize> = (offset..start).collect();
-        strategy::rank_top_k(query, &records, self.config.top_k)
+        // **先切片再 top-k**：若先 rank 再过滤尾部，本轮的几条新记录会占满
+        // k 个名额又被全部滤掉，结果恒为空（多行拆分后必现）。
+        let searchable = &records[..keep];
+        strategy::rank_top_k(query, searchable, self.config.top_k)
             .into_iter()
-            .filter(|hit| !(exclude_last && Some(hit.index) == last))
             .filter(|hit| !covered.contains(&(hit.index + offset)))
-            .map(|hit| records[hit.index].clone())
+            .map(|hit| searchable[hit.index].clone())
             .collect()
     }
 
@@ -502,13 +534,15 @@ impl MemoryRuntime {
     ///
     /// # 会话注入（L1 产品级）
     ///
-    /// - **有会话**：命中只写本 Mod 的来源槽
-    ///   （`set_owned(SESSION_PROMPT_OWNER_MEMORY, session, 只有记忆块)`）；
-    ///   没有命中 / 注入被关掉则 `clear_owned` 清掉该槽（幂等）。**绝不**写全局
+    /// - **有会话**：命中或摘要在手 → 只写本 Mod 的来源槽
+    ///   （`set_owned(SESSION_PROMPT_OWNER_MEMORY, session, 只有记忆块)`，
+    ///   **整段替换**上一轮的块）；注入开关关掉 → `clear_owned` 清掉该槽
+    ///   （幂等）；注入开着但本轮未命中且无摘要 → **保留上一轮的块**（不清槽，
+    ///   日志说明「本轮未命中，保留上一轮注入块」）。**绝不**写全局
     ///   `persona.system_prompt`，也**绝不**把 persona 的卡拼进来再写回
     ///   ——A 会话的记忆串到 B、或覆盖别人的槽，就是这么发生的；
-    /// - **无会话**（裸 HTTP / 终端壳）：保持老路径 `apply_settings` 全局写回；
-    ///   这是文档与面板都写明的**降级**，不是等价能力；
+    /// - **无会话**（裸 HTTP / 终端壳）：写入 `memory.jsonl`，**不注入**，也
+    ///   **不写**全局 `persona.system_prompt`（P1-5 起删掉全局降级，不是等价能力）；
     /// - **本轮生效**：本函数在请求体构建之前跑完，且 host 对 TurnPrompt 同步投递
     ///   system_prompt 上路（§2 时序，未变）。
     fn handle_turn_prompt(&mut self, payload: &str) {
@@ -542,38 +576,45 @@ impl MemoryRuntime {
                 "memory 无 conversation：记忆写入老桶 memory.jsonl，本轮不注入（不写全局 persona.system_prompt）",
             );
         }
-        let stored = self.remember(text, strategy::unix_now(), self.turn_seq);
-        let hits = self.retrieve_with(text, stored);
+        // 用户原文按换行拆成多条记录（一条一行；空行跳过），同轮共用一个 turn。
+        // 检索仍用**整段原文**，但一次排除本轮刚写入的全部记录（不自命中）。
+        let written = self.remember_lines(text, strategy::unix_now(), self.turn_seq);
+        let hits = self.retrieve_excluding_tail(text, written);
         self.last_hits = hits.len();
         self.hits += hits.len() as u64;
         let summary_text = self.summary_text.clone();
         let injectable = summary_text.is_some() || !hits.is_empty();
-        if !self.config.enabled_injection || !injectable {
-            // 「没东西可注入」比「留上一轮的旧块」更正确：清掉本 Mod 的槽。
-            // 幂等（本来没有就是 no-op），且只清自己的 owner。
-            // 注意：**摘要也算「有东西可注入」**——只有摘要在手时绝不能清槽。
-            if let Some(session) = self.current_session.clone() {
-                self.clear_session_injection(&session);
-            }
-            if self.config.enabled_injection && hits.is_empty() && summary_text.is_none() {
-                self.services
-                    .logger
-                    .info("memory 本轮没有相关记忆，已清掉本 Mod 的注入槽（no-op）");
-            }
-        } else {
-            match self.current_session.clone() {
-                Some(session) => self.inject_into_session(&session, summary_text.as_deref(), &hits),
-                None => {
-                    // P1-5：**删掉全局降级**——无 conversation 绝不写 persona.system_prompt
-                    // （那是「两份真相」的来源，还会污染所有会话）。计数与说明在上面已做。
+        match self.current_session.clone() {
+            Some(session) => {
+                if !self.config.enabled_injection {
+                    // 注入开关关掉：**仍然清**该会话的槽，别让旧块继续喂模型。
+                    // 幂等（本来没有就是 no-op），且只清自己的 owner。
+                    self.clear_session_injection(&session);
+                    self.services.logger.info(&format!(
+                        "memory 注入开关已关闭，已清掉会话 {session} 的注入槽"
+                    ));
+                } else if injectable {
+                    // 命中或摘要在手：set_owned **整段替换**上一轮的块。
+                    self.inject_into_session(&session, summary_text.as_deref(), &hits);
+                } else {
+                    // 本轮未命中且无摘要：**保留上一轮注入块**——上一轮命中的
+                    // 记忆对下一轮仍然有效，清槽只会让上下文忽有忽无。
+                    self.services.logger.info(&format!(
+                        "memory 本轮未命中，保留上一轮注入块（会话 {session}）"
+                    ));
                 }
+            }
+            None => {
+                // P1-5：无 conversation 只写 memory.jsonl——不注入，也绝不写
+                // 全局 persona.system_prompt（那是「两份真相」的来源，还会污染
+                // 所有会话）。计数与说明在上面已做。
             }
         }
         // 摘要触发放最后：先让本轮注入落地，再决定要不要起后台（顺序不影响本轮）。
         self.maybe_spawn_summary();
     }
 
-    /// 清掉本 Mod 在某会话的注入槽（能力不可用 / 无命中时调用）。
+    /// 清掉本 Mod 在某会话的注入槽（注入开关关闭 / 摘要回滚 / 能力不可用时调用）。
     ///
     /// 只碰自己的 owner：persona 在同一会话里的角色卡不受影响。
     fn clear_session_injection(&mut self, session: &str) {
@@ -879,6 +920,9 @@ mod assistant_tests;
 #[cfg(test)]
 #[path = "commands_tests.rs"]
 mod commands_tests;
+#[cfg(test)]
+#[path = "injection_tests.rs"]
+mod injection_tests;
 #[cfg(test)]
 #[path = "quality_tests.rs"]
 mod quality_tests;

@@ -168,3 +168,67 @@ fn user_and_assistant_records_never_share_an_id() {
     // 老行（无 id）按用户口径派生，id 与旧版一致。
     assert_eq!(user.id, MemoryRecord::make_id(100, 1, "嗯"));
 }
+
+/// 助手记录的 turn 必须**等于同轮用户行**的 turn；payload.turn 只进日志。
+#[test]
+fn assistant_turn_matches_user_turn_and_ignores_payload_turn() {
+    let dir = temp_dir("asst-turn");
+    let host = FakeHost::new("基础人设");
+    let mut rt = runtime(&dir, &host, serde_json::json!({}));
+    rt.on_scoped_event(ModEventTopic::TurnPrompt, "我喜欢薄荷", Some("s1"))
+        .unwrap();
+    let payload = serde_json::json!({
+        "turn": 999, "role": "assistant", "text": "好呀，记住薄荷了。",
+    })
+    .to_string();
+    rt.on_scoped_event(ModEventTopic::AssistantReplied, &payload, Some("s1"))
+        .unwrap();
+
+    let raw = std::fs::read_to_string(dir.join("sessions").join("s1.memory.jsonl"))
+        .expect("会话桶必须存在");
+    let lines: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("每行都是 JSON"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{raw}");
+    assert_eq!(lines[0]["role"], "user");
+    assert_eq!(lines[0]["turn"], 1);
+    assert_eq!(lines[1]["role"], "assistant");
+    assert_eq!(
+        lines[1]["turn"], 1,
+        "助手行必须与同轮用户行共用 turn（忽略 payload.turn=999）: {raw}"
+    );
+    assert!(
+        host.logs().iter().any(|l| l.contains("payload.turn=999")),
+        "payload.turn 必须只写进日志: {:?}",
+        host.logs()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 桶里没有用户记录：保守回落 `self.turn_seq`（不是 payload.turn）。
+#[test]
+fn assistant_turn_falls_back_to_turn_seq_without_a_user_record() {
+    let dir = temp_dir("asst-turn-fallback");
+    let host = FakeHost::new("基础人设");
+    let mut rt = runtime(&dir, &host, serde_json::json!({}));
+    // 另一个会话的一轮，把 self.turn_seq 推到 1；s2 自己的桶里没有用户行。
+    rt.on_scoped_event(ModEventTopic::TurnPrompt, "我喜欢薄荷", Some("s1"))
+        .unwrap();
+    let payload = serde_json::json!({
+        "turn": 999, "role": "assistant", "text": "这句没有同轮用户行。",
+    })
+    .to_string();
+    rt.on_scoped_event(ModEventTopic::AssistantReplied, &payload, Some("s2"))
+        .unwrap();
+
+    let raw = std::fs::read_to_string(dir.join("sessions").join("s2.memory.jsonl"))
+        .expect("s2 桶必须存在");
+    let line: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+    assert_eq!(line["role"], "assistant");
+    assert_eq!(
+        line["turn"], 1,
+        "无用户记录 → 回落 self.turn_seq（不是 payload.turn）: {raw}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

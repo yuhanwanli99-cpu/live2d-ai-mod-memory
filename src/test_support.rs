@@ -298,9 +298,9 @@ impl FakeHost {
             .to_string()
     }
 
-    /// 模拟**另一个**写 `persona.system_prompt` 的 Mod（如 persona）落地一次写：
-    /// 直接改快照，不经过本 Mod 的 `apply_settings` 记录——这是 last-writer-wins
-    /// 的「前写者/后写者」注入点。
+    /// 模拟**旧版本 / 另一个**写 `persona.system_prompt` 的来源直接改快照，
+    /// 不经过本 Mod 的 `apply_settings` 记录——现在只用来给「旧版本残留」造现场
+    /// （停用剥离回归）。P1-5 起本 Mod 的被动路径不再写全局提示词。
     pub(crate) fn set_main_prompt(&self, prompt: &str) {
         self.settings
             .lock()
